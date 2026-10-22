@@ -1,0 +1,65 @@
+{
+  "description": "Development sample registry. Replace this file-backed list with your authenticated registration/database lookup for production.",
+  "devices": [
+    {
+      "data_mesh_id": "MESH001",
+      "registered_device_id": "D001",
+      "device_type": "smart_watch",
+      "telemetry_interval_seconds": 5
+    },
+    {
+      "data_mesh_id": "MESH001",
+      "registered_device_id": "D002",
+      "device_type": "bp_monitor",
+      "telemetry_interval_seconds": 5
+    },
+    {
+      "data_mesh_id": "MESH001",
+      "registered_device_id": "D003",
+      "device_type": "glucose_monitor",
+      "telemetry_interval_seconds": 5
+    },
+    {
+      "data_mesh_id": "MESH001",
+      "registered_device_id": "D004",
+      "device_type": "pulse_oximeter",
+      "telemetry_interval_seconds": 5
+    },
+    {
+      "data_mesh_id": "MESH001",
+      "registered_device_id": "D005",
+      "device_type": "ecg_monitor",
+      "telemetry_interval_seconds": 5
+    },
+    {
+      "data_mesh_id": "MESH001",
+      "registered_device_id": "D006",
+      "device_type": "smart_watch",
+      "telemetry_interval_seconds": 5
+    },
+    {
+      "data_mesh_id": "MESH001",
+      "registered_device_id": "D007",
+      "device_type": "bp_monitor",
+      "telemetry_interval_seconds": 5
+    },
+    {
+      "data_mesh_id": "MESH001",
+      "registered_device_id": "D008",
+      "device_type": "glucose_monitor",
+      "telemetry_interval_seconds": 5
+    },
+    {
+      "data_mesh_id": "MESH001",
+      "registered_device_id": "D009",
+      "device_type": "ecg_monitor",
+      "telemetry_interval_seconds": 5
+    },
+    {
+      "data_mesh_id": "MESH001",
+      "registered_device_id": "D010",
+      "device_type": "pulse_oximeter",
+      "telemetry_interval_seconds": 5
+    }
+  ]
+}
