@@ -19,6 +19,11 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Log in to Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
       - name: Log in to Azure Container Registry
         uses: docker/login-action@v3
         with:
@@ -34,30 +39,30 @@ jobs:
             .
           docker push "${{ secrets.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:${{ github.sha }}"
           docker push "${{ secrets.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:latest"
-      - name: Log in to Azure
-        uses: azure/login@v2
-        with:
-          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Configure Azure Web App settings
+        env:
+          DATABASE_URL: ${{ secrets.IOMT_DATABASE_URL }}
+        run: |
+          az webapp config appsettings set \
+            --resource-group "$RESOURCE_GROUP" \
+            --name "$WEBAPP_NAME" \
+            --settings \
+              WEBSITES_PORT=8000 \
+              IOMT_DATABASE_URL="$DATABASE_URL"
 
       - name: Configure Azure Web App container
-        uses: azure/CLI@v2
-        with:
-          inlineScript: |
-            az webapp config appsettings set \
-              --resource-group "$RESOURCE_GROUP" \
-              --name "$WEBAPP_NAME" \
-              --settings \
-                WEBSITES_PORT=8000 \
-                IOMT_DATABASE_URL="${{ secrets.IOMT_DATABASE_URL }}"
+        run: |
+          az webapp config container set \
+            --resource-group "$RESOURCE_GROUP" \
+            --name "$WEBAPP_NAME" \
+            --docker-custom-image-name "${{ secrets.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:${{ github.sha }}" \
+            --docker-registry-server-url "https://${{ secrets.ACR_LOGIN_SERVER }}" \
+            --docker-registry-server-user "${{ secrets.ACR_USERNAME }}" \
+            --docker-registry-server-password "${{ secrets.ACR_PASSWORD }}"
 
-            az webapp config container set \
-              --resource-group "$RESOURCE_GROUP" \
-              --name "$WEBAPP_NAME" \
-              --docker-custom-image-name "${{ secrets.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:${{ github.sha }}" \
-              --docker-registry-server-url "https://${{ secrets.ACR_LOGIN_SERVER }}" \
-              --docker-registry-server-user "${{ secrets.ACR_USERNAME }}" \
-              --docker-registry-server-password "${{ secrets.ACR_PASSWORD }}"
-
-            az webapp restart \
-              --resource-group "$RESOURCE_GROUP" \
-              --name "$WEBAPP_NAME"
+      - name: Restart Data Mesh application
+        run: |
+          az webapp restart \
+            --resource-group "$RESOURCE_GROUP" \
+            --name "$WEBAPP_NAME"
