@@ -1,0 +1,63 @@
+name: Deploy IoMT Data Mesh to Azure
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+env:
+  RESOURCE_GROUP: iomt-rg
+  WEBAPP_NAME: iomt-data-mesh-app
+  IMAGE_NAME: iomt-data-mesh
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Log in to Azure Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ secrets.ACR_LOGIN_SERVER }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
+      - name: Build and push Data Mesh image
+        run: |
+          docker build \
+            -t "${{ secrets.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:${{ github.sha }}" \
+            -t "${{ secrets.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:latest" \
+            .
+          docker push "${{ secrets.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:${{ github.sha }}"
+          docker push "${{ secrets.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:latest"
+      - name: Log in to Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Configure Azure Web App container
+        uses: azure/CLI@v2
+        with:
+          inlineScript: |
+            az webapp config appsettings set \
+              --resource-group "$RESOURCE_GROUP" \
+              --name "$WEBAPP_NAME" \
+              --settings \
+                WEBSITES_PORT=8000 \
+                IOMT_DATABASE_URL="${{ secrets.IOMT_DATABASE_URL }}"
+
+            az webapp config container set \
+              --resource-group "$RESOURCE_GROUP" \
+              --name "$WEBAPP_NAME" \
+              --docker-custom-image-name "${{ secrets.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:${{ github.sha }}" \
+              --docker-registry-server-url "https://${{ secrets.ACR_LOGIN_SERVER }}" \
+              --docker-registry-server-user "${{ secrets.ACR_USERNAME }}" \
+              --docker-registry-server-password "${{ secrets.ACR_PASSWORD }}"
+
+            az webapp restart \
+              --resource-group "$RESOURCE_GROUP" \
+              --name "$WEBAPP_NAME"
