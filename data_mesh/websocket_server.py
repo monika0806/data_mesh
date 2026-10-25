@@ -16,7 +16,13 @@ from typing import Any
 import psycopg
 from azure.core.exceptions import AzureError
 from azure.storage.blob import BlobServiceClient, ContentSettings
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import (
+    FastAPI,
+    HTTPException,
+    Query,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 
@@ -325,6 +331,204 @@ def health():
 
     return status
 
+
+def list_registered_devices() -> list[dict[str, Any]]:
+    """List registered devices from the authoritative registration database."""
+    if not REGISTRATION_DATABASE_URL:
+        raise HTTPException(
+            status_code=503,
+            detail="Registration database is not configured",
+        )
+
+    try:
+        with psycopg.connect(
+            REGISTRATION_DATABASE_URL,
+            connect_timeout=5,
+        ) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT registered_device_id, device_type, status
+                    FROM public.devices
+                    ORDER BY registered_device_id
+                    """
+                )
+                rows = cur.fetchall()
+    except Exception as exc:
+        logger.exception("Failed to list registered devices")
+        raise HTTPException(
+            status_code=503,
+            detail="Registration database is unavailable",
+        ) from exc
+
+    return [
+        {
+            "registered_device_id": row[0],
+            "device_type": row[1],
+            "status": row[2],
+        }
+        for row in rows
+    ]
+
+
+def read_device_blobs(
+    registered_device_id: str,
+    device_type: str,
+    limit: int,
+) -> list[dict[str, Any]]:
+    """Read the latest telemetry blobs for one registered device."""
+    product_id = product_for_type(device_type)
+    if product_id is None:
+        return []
+
+    prefix = (
+        f"{PRODUCT_NAMES[product_id]}/"
+        f"{registered_device_id}/"
+    )
+
+    try:
+        container = get_blob_container()
+        blobs = container.list_blobs(name_starts_with=prefix)
+
+        # Blob names contain a timestamp and unique ID, but list order
+        # is not guaranteed. Sort after collecting the newest candidates.
+        names = sorted(
+            (blob.name for blob in blobs),
+            reverse=True,
+        )[-limit:]
+
+        records = []
+        for name in reversed(names):
+            try:
+                payload = container.get_blob_client(name).download_blob().readall()
+                record = json.loads(payload)
+                if record.get("registered_device_id") != registered_device_id:
+                    continue
+                records.append(record)
+            except (ValueError, json.JSONDecodeError):
+                logger.warning("Skipping invalid telemetry blob: %s", name)
+
+        records.sort(
+            key=lambda item: item.get("received_at", ""),
+            reverse=True,
+        )
+        return records[:limit]
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Failed to read telemetry blobs")
+        raise HTTPException(
+            status_code=503,
+            detail="Telemetry storage is unavailable",
+        ) from exc
+
+
+@app.get("/api/telemetry")
+def get_telemetry(
+    data_mesh_id: str = Query(min_length=1, max_length=50),
+    registered_device_id: str | None = Query(
+        default=None,
+        min_length=1,
+        max_length=150,
+    ),
+    limit: int = Query(default=100, ge=1, le=500),
+):
+    """Return telemetry for a registered device or the requested mesh."""
+    devices = list_registered_devices()
+
+    if registered_device_id:
+        device = next(
+            (
+                item for item in devices
+                if item["registered_device_id"] == registered_device_id
+            ),
+            None,
+        )
+        if device is None:
+            raise HTTPException(status_code=404, detail="Device not found")
+
+        status = str(device.get("status") or "").strip().lower()
+        if status not in ALLOWED_DEVICE_STATUSES:
+            raise HTTPException(
+                status_code=403,
+                detail="Device is not active",
+            )
+
+        records = read_device_blobs(
+            registered_device_id,
+            str(device["device_type"]),
+            limit,
+        )
+        records = [
+            record for record in records
+            if record.get("data_mesh_id") == data_mesh_id
+        ]
+    else:
+        records = []
+        for device in devices:
+            if str(device.get("status") or "").strip().lower() not in ALLOWED_DEVICE_STATUSES:
+                continue
+            records.extend(
+                read_device_blobs(
+                    str(device["registered_device_id"]),
+                    str(device["device_type"]),
+                    limit,
+                )
+            )
+        records = [
+            record for record in records
+            if record.get("data_mesh_id") == data_mesh_id
+        ]
+        records.sort(
+            key=lambda item: item.get("received_at", ""),
+            reverse=True,
+        )
+        records = records[:limit]
+
+    return {
+        "data_mesh_id": data_mesh_id,
+        "count": len(records),
+        "records": records,
+    }
+
+
+@app.get("/api/devices")
+def get_devices(
+    data_mesh_id: str = Query(min_length=1, max_length=50),
+):
+    """List registered devices and their latest telemetry record."""
+    devices = list_registered_devices()
+    result = []
+
+    for device in devices:
+        if str(device.get("status") or "").strip().lower() not in ALLOWED_DEVICE_STATUSES:
+            continue
+
+        records = read_device_blobs(
+            str(device["registered_device_id"]),
+            str(device["device_type"]),
+            1,
+        )
+        latest = next(
+            (
+                record for record in records
+                if record.get("data_mesh_id") == data_mesh_id
+            ),
+            None,
+        )
+
+        result.append({
+            **device,
+            "data_mesh_id": data_mesh_id,
+            "latest_reading": latest,
+        })
+
+    return {
+        "data_mesh_id": data_mesh_id,
+        "count": len(result),
+        "devices": result,
+    }
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
