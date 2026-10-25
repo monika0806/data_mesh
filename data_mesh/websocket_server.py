@@ -14,8 +14,6 @@ from datetime import datetime, timezone
 from typing import Any
 
 import psycopg2
-from psycopg2.extras import RealDictCursor
-from azure.core.exceptions import AzureError
 from azure.storage.blob import BlobServiceClient, ContentSettings
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, Header, HTTPException
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -327,204 +325,6 @@ def health():
     return status
 
 
-def list_registered_devices() -> list[dict[str, Any]]:
-    """List registered devices from the authoritative registration database."""
-    if not REGISTRATION_DATABASE_URL:
-        raise HTTPException(
-            status_code=503,
-            detail="Registration database is not configured",
-        )
-
-    try:
-        with psycopg.connect(
-            REGISTRATION_DATABASE_URL,
-            connect_timeout=5,
-        ) as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT registered_device_id, device_type, status
-                    FROM public.devices
-                    ORDER BY registered_device_id
-                    """
-                )
-                rows = cur.fetchall()
-    except Exception as exc:
-        logger.exception("Failed to list registered devices")
-        raise HTTPException(
-            status_code=503,
-            detail="Registration database is unavailable",
-        ) from exc
-
-    return [
-        {
-            "registered_device_id": row[0],
-            "device_type": row[1],
-            "status": row[2],
-        }
-        for row in rows
-    ]
-
-
-def read_device_blobs(
-    registered_device_id: str,
-    device_type: str,
-    limit: int,
-) -> list[dict[str, Any]]:
-    """Read the latest telemetry blobs for one registered device."""
-    product_id = product_for_type(device_type)
-    if product_id is None:
-        return []
-
-    prefix = (
-        f"{PRODUCT_NAMES[product_id]}/"
-        f"{registered_device_id}/"
-    )
-
-    try:
-        container = get_blob_container()
-        blobs = container.list_blobs(name_starts_with=prefix)
-
-        # Blob names contain a timestamp and unique ID, but list order
-        # is not guaranteed. Sort after collecting the newest candidates.
-        names = sorted(
-            (blob.name for blob in blobs),
-            reverse=True,
-        )[-limit:]
-
-        records = []
-        for name in reversed(names):
-            try:
-                payload = container.get_blob_client(name).download_blob().readall()
-                record = json.loads(payload)
-                if record.get("registered_device_id") != registered_device_id:
-                    continue
-                records.append(record)
-            except (ValueError, json.JSONDecodeError):
-                logger.warning("Skipping invalid telemetry blob: %s", name)
-
-        records.sort(
-            key=lambda item: item.get("received_at", ""),
-            reverse=True,
-        )
-        return records[:limit]
-
-    except HTTPException:
-        raise
-    except Exception as exc:
-        logger.exception("Failed to read telemetry blobs")
-        raise HTTPException(
-            status_code=503,
-            detail="Telemetry storage is unavailable",
-        ) from exc
-
-
-@app.get("/api/telemetry")
-def get_telemetry(
-    data_mesh_id: str = Query(min_length=1, max_length=50),
-    registered_device_id: str | None = Query(
-        default=None,
-        min_length=1,
-        max_length=150,
-    ),
-    limit: int = Query(default=100, ge=1, le=500),
-):
-    """Return telemetry for a registered device or the requested mesh."""
-    devices = list_registered_devices()
-
-    if registered_device_id:
-        device = next(
-            (
-                item for item in devices
-                if item["registered_device_id"] == registered_device_id
-            ),
-            None,
-        )
-        if device is None:
-            raise HTTPException(status_code=404, detail="Device not found")
-
-        status = str(device.get("status") or "").strip().lower()
-        if status not in ALLOWED_DEVICE_STATUSES:
-            raise HTTPException(
-                status_code=403,
-                detail="Device is not active",
-            )
-
-        records = read_device_blobs(
-            registered_device_id,
-            str(device["device_type"]),
-            limit,
-        )
-        records = [
-            record for record in records
-            if record.get("data_mesh_id") == data_mesh_id
-        ]
-    else:
-        records = []
-        for device in devices:
-            if str(device.get("status") or "").strip().lower() not in ALLOWED_DEVICE_STATUSES:
-                continue
-            records.extend(
-                read_device_blobs(
-                    str(device["registered_device_id"]),
-                    str(device["device_type"]),
-                    limit,
-                )
-            )
-        records = [
-            record for record in records
-            if record.get("data_mesh_id") == data_mesh_id
-        ]
-        records.sort(
-            key=lambda item: item.get("received_at", ""),
-            reverse=True,
-        )
-        records = records[:limit]
-
-    return {
-        "data_mesh_id": data_mesh_id,
-        "count": len(records),
-        "records": records,
-    }
-
-
-@app.get("/api/devices")
-def get_devices(
-    data_mesh_id: str = Query(min_length=1, max_length=50),
-):
-    """List registered devices and their latest telemetry record."""
-    devices = list_registered_devices()
-    result = []
-
-    for device in devices:
-        if str(device.get("status") or "").strip().lower() not in ALLOWED_DEVICE_STATUSES:
-            continue
-
-        records = read_device_blobs(
-            str(device["registered_device_id"]),
-            str(device["device_type"]),
-            1,
-        )
-        latest = next(
-            (
-                record for record in records
-                if record.get("data_mesh_id") == data_mesh_id
-            ),
-            None,
-        )
-
-        result.append({
-            **device,
-            "data_mesh_id": data_mesh_id,
-            "latest_reading": latest,
-        })
-
-    return {
-        "data_mesh_id": data_mesh_id,
-        "count": len(result),
-        "devices": result,
-    }
-
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
@@ -695,138 +495,158 @@ async def websocket_endpoint(websocket: WebSocket):
 
 READ_API_KEY = os.getenv("IOMT_READ_API_KEY", "")
 
-PRODUCT_BY_DEVICE_TYPE = {
-    "smart_watch": "smartwatch-readings",
-    "bp_monitor": "blood-pressure-readings",
-    "glucose_monitor": "glucose-readings",
-    "pulse_oximeter": "pulse-oximeter-readings",
-    "ecg_monitor": "ecg-readings",
-}
+
+def read_device_blobs(
+    registered_device_id: str,
+    device_type: str,
+    limit: int,
+) -> list[dict[str, Any]]:
+    """Read telemetry blobs for one registered device and its resolved product."""
+    product_id = product_for_type(device_type)
+    if product_id is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported registered device type: {device_type}",
+        )
+
+    # Blob paths are partitioned by product and registered device.
+    prefix = f"{PRODUCT_NAMES[product_id]}/{registered_device_id}/"
+    try:
+        container = get_blob_container()
+        blobs = container.list_blobs(name_starts_with=prefix)
+
+        # Sort blob paths newest-first before downloading, avoiding downloads
+        # of every historical blob when a device has a long history.
+        blob_names = sorted(
+            (blob.name for blob in blobs),
+            reverse=True,
+        )[:limit]
+
+        records: list[dict[str, Any]] = []
+        for blob_name in blob_names:
+            try:
+                raw = container.get_blob_client(blob_name).download_blob().readall()
+                record = json.loads(raw)
+                if record.get("registered_device_id") != registered_device_id:
+                    continue
+                records.append(record)
+            except (ValueError, json.JSONDecodeError):
+                logger.warning("Skipping invalid telemetry blob: %s", blob_name)
+
+        return records
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Failed to read telemetry blobs for device %s", registered_device_id)
+        raise HTTPException(
+            status_code=503,
+            detail="Telemetry storage is unavailable",
+        ) from exc
 
 
 @app.get("/api/telemetry")
 def read_device_telemetry(
-    registered_device_id: str = Query(..., min_length=1),
+    registered_device_id: str = Query(..., min_length=1, max_length=150),
+    device_type: str | None = Query(default=None, min_length=1, max_length=100),
     start: str | None = Query(default=None),
     end: str | None = Query(default=None),
     sort: str = Query(default="newest", pattern="^(newest|oldest)$"),
     limit: int = Query(default=100, ge=1, le=1000),
     x_iomt_read_key: str | None = Header(default=None),
 ):
-    # Never leave the read API unprotected.
+    """Return telemetry for one registered device; resolve its product from PostgreSQL.
+
+    `data_mesh_id` is deliberately not required. A device's authoritative type
+    is read from PostgreSQL, and that type selects the appropriate product/blob
+    prefix. If a caller supplies device_type, it must match the registration.
+    """
     if not READ_API_KEY:
         raise HTTPException(
             status_code=503,
             detail="Telemetry read API is not configured",
         )
-
     if x_iomt_read_key != READ_API_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    # Confirm registration and apply the same status policy used by ingestion.
     try:
         device = get_registered_device(registered_device_id)
-    except Exception:
+    except Exception as exc:
         logger.exception("Device registration lookup failed")
         raise HTTPException(
             status_code=503,
             detail="Registration service unavailable",
-        )
+        ) from exc
 
     if not device:
         raise HTTPException(status_code=404, detail="Device not found")
 
-    device_status = str(device.get("status") or "").strip().lower()
-    if device_status not in ALLOWED_DEVICE_STATUSES:
+    status = str(device.get("status") or "").strip().lower()
+    if status not in ALLOWED_DEVICE_STATUSES:
         raise HTTPException(status_code=403, detail="Device status is not allowed")
 
-    product_id = product_for_type(str(device.get("device_type") or ""))
-    if not product_id:
-        raise HTTPException(status_code=400, detail="Unsupported device type")
+    registered_type = str(device.get("device_type") or "").strip()
+    if device_type and canonical_type(device_type) != canonical_type(registered_type):
+        raise HTTPException(status_code=400, detail="Device type does not match registration")
 
-    product_name = PRODUCT_NAMES[product_id]
+    product_id = product_for_type(registered_type)
+    if product_id is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported registered device type: {registered_type}",
+        )
 
-    # Validate optional date boundaries.
     try:
         start_dt = datetime.fromisoformat(start.replace("Z", "+00:00")) if start else None
         end_dt = datetime.fromisoformat(end.replace("Z", "+00:00")) if end else None
-
         if start_dt and start_dt.tzinfo is None:
             start_dt = start_dt.replace(tzinfo=timezone.utc)
         if end_dt and end_dt.tzinfo is None:
             end_dt = end_dt.replace(tzinfo=timezone.utc)
-
         if start_dt and end_dt and start_dt > end_dt:
             raise ValueError("start must not be after end")
-    except (ValueError, AttributeError):
+    except (ValueError, AttributeError) as exc:
         raise HTTPException(
             status_code=400,
-            detail="Use valid ISO dates for start and end",
-        )
+            detail="Use valid ISO dates for start and end; start must not be after end",
+        ) from exc
 
-    connection_string = os.getenv("AZURE_STORAGE_CONNECTION_STRING")
-    container_name = TELEMETRY_CONTAINER
+    records = read_device_blobs(registered_device_id, registered_type, limit=1000)
 
-    if not connection_string:
-        raise HTTPException(
-            status_code=503,
-            detail="Telemetry storage is not configured",
-        )
+    filtered: list[dict[str, Any]] = []
+    for record in records:
+        timestamp_text = record.get("device_timestamp") or record.get("received_at")
+        if not timestamp_text:
+            continue
+        try:
+            timestamp = datetime.fromisoformat(timestamp_text.replace("Z", "+00:00"))
+        except (ValueError, AttributeError):
+            logger.warning("Skipping telemetry record with invalid timestamp for %s", registered_device_id)
+            continue
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.replace(tzinfo=timezone.utc)
+        if start_dt and timestamp < start_dt:
+            continue
+        if end_dt and timestamp > end_dt:
+            continue
+        filtered.append(record)
 
-    # Blobs are partitioned by product/device/date.
-    prefix = f"{product_name}/{registered_device_id}/"
-    records = []
-
-    try:
-        service = BlobServiceClient.from_connection_string(
-            connection_string
-        )
-        container = service.get_container_client(container_name)
-
-        for blob in container.list_blobs(name_starts_with=prefix):
-            blob_client = container.get_blob_client(blob.name)
-            record = json.loads(
-                blob_client.download_blob().readall()
-            )
-
-            timestamp_text = (
-                record.get("device_timestamp")
-                or record.get("received_at")
-            )
-            if not timestamp_text:
-                continue
-
-            timestamp = datetime.fromisoformat(
-                timestamp_text.replace("Z", "+00:00")
-            )
-            if timestamp.tzinfo is None:
-                timestamp = timestamp.replace(tzinfo=timezone.utc)
-
-            if start_dt and timestamp < start_dt:
-                continue
-            if end_dt and timestamp > end_dt:
-                continue
-
-            records.append(record)
-
-    except Exception:
-        logger.exception("Blob telemetry retrieval failed")
-        raise HTTPException(
-            status_code=503,
-            detail="Unable to retrieve telemetry",
-        )
-
-    records.sort(
-        key=lambda r: (
-            r.get("device_timestamp") or r.get("received_at") or ""
-        ),
+    filtered.sort(
+        key=lambda record: record.get("device_timestamp") or record.get("received_at") or "",
         reverse=(sort == "newest"),
     )
+    filtered = filtered[:limit]
 
     return {
         "registered_device_id": registered_device_id,
-        "device_type": device_type,
-        "count": min(len(records), limit),
+        "device_type": registered_type,
+        "product_id": product_id,
+        "product_name": PRODUCT_NAMES[product_id],
+        "data_mesh_ids": sorted({
+            str(record["data_mesh_id"])
+            for record in filtered
+            if record.get("data_mesh_id") is not None
+        }),
+        "count": len(filtered),
         "sort": sort,
-        "telemetry": records[:limit],
+        "telemetry": filtered,
     }
