@@ -13,10 +13,11 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any
 
-import psycopg
+import psycopg2
+from psycopg2.extras import RealDictCursor
 from azure.core.exceptions import AzureError
 from azure.storage.blob import BlobServiceClient, ContentSettings
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Header, HTTPException, Query, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 
@@ -143,7 +144,7 @@ def get_registered_device(
         )
 
     # Read-only SELECT. No registration records are created or modified.
-    with psycopg.connect(
+    with psycopg2.connect(
         REGISTRATION_DATABASE_URL,
         connect_timeout=5,
     ) as conn:
@@ -298,7 +299,7 @@ def health():
         }
 
     try:
-        with psycopg.connect(
+        with psycopg2.connect(
             REGISTRATION_DATABASE_URL,
             connect_timeout=3,
         ) as conn:
@@ -489,3 +490,145 @@ async def websocket_endpoint(websocket: WebSocket):
             "WebSocket client disconnected: %s",
             client,
         )
+
+# --------------------------------------------------
+# Read-only telemetry API
+# --------------------------------------------------
+
+READ_API_KEY = os.getenv("IOMT_READ_API_KEY", "")
+
+PRODUCT_BY_DEVICE_TYPE = {
+    "smart_watch": "smartwatch-readings",
+    "bp_monitor": "blood-pressure-readings",
+    "glucose_monitor": "glucose-readings",
+    "pulse_oximeter": "pulse-oximeter-readings",
+    "ecg_monitor": "ecg-readings",
+}
+
+
+@app.get("/api/telemetry")
+def read_device_telemetry(
+    registered_device_id: str = Query(..., min_length=1),
+    start: str | None = Query(default=None),
+    end: str | None = Query(default=None),
+    sort: str = Query(default="newest", pattern="^(newest|oldest)$"),
+    limit: int = Query(default=100, ge=1, le=1000),
+    x_iomt_read_key: str | None = Header(default=None),
+):
+    # Never leave the read API unprotected.
+    if not READ_API_KEY:
+        raise HTTPException(
+            status_code=503,
+            detail="Telemetry read API is not configured",
+        )
+
+    if x_iomt_read_key != READ_API_KEY:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    # Confirm registration and apply the same status policy used by ingestion.
+    try:
+        device = get_registered_device(registered_device_id)
+    except Exception:
+        logger.exception("Device registration lookup failed")
+        raise HTTPException(
+            status_code=503,
+            detail="Registration service unavailable",
+        )
+
+    if not device:
+        raise HTTPException(status_code=404, detail="Device not found")
+
+    device_status = str(device.get("status") or "").strip().lower()
+    if device_status not in ALLOWED_DEVICE_STATUSES:
+        raise HTTPException(status_code=403, detail="Device status is not allowed")
+
+    product_id = product_for_type(str(device.get("device_type") or ""))
+    if not product_id:
+        raise HTTPException(status_code=400, detail="Unsupported device type")
+
+    product_name = PRODUCT_NAMES[product_id]
+
+    # Validate optional date boundaries.
+    try:
+        start_dt = datetime.fromisoformat(start.replace("Z", "+00:00")) if start else None
+        end_dt = datetime.fromisoformat(end.replace("Z", "+00:00")) if end else None
+
+        if start_dt and start_dt.tzinfo is None:
+            start_dt = start_dt.replace(tzinfo=timezone.utc)
+        if end_dt and end_dt.tzinfo is None:
+            end_dt = end_dt.replace(tzinfo=timezone.utc)
+
+        if start_dt and end_dt and start_dt > end_dt:
+            raise ValueError("start must not be after end")
+    except (ValueError, AttributeError):
+        raise HTTPException(
+            status_code=400,
+            detail="Use valid ISO dates for start and end",
+        )
+
+    connection_string = os.getenv("AZURE_STORAGE_CONNECTION_STRING")
+    container_name = TELEMETRY_CONTAINER
+
+    if not connection_string:
+        raise HTTPException(
+            status_code=503,
+            detail="Telemetry storage is not configured",
+        )
+
+    # Blobs are partitioned by product/device/date.
+    prefix = f"{product_name}/{registered_device_id}/"
+    records = []
+
+    try:
+        service = BlobServiceClient.from_connection_string(
+            connection_string
+        )
+        container = service.get_container_client(container_name)
+
+        for blob in container.list_blobs(name_starts_with=prefix):
+            blob_client = container.get_blob_client(blob.name)
+            record = json.loads(
+                blob_client.download_blob().readall()
+            )
+
+            timestamp_text = (
+                record.get("device_timestamp")
+                or record.get("received_at")
+            )
+            if not timestamp_text:
+                continue
+
+            timestamp = datetime.fromisoformat(
+                timestamp_text.replace("Z", "+00:00")
+            )
+            if timestamp.tzinfo is None:
+                timestamp = timestamp.replace(tzinfo=timezone.utc)
+
+            if start_dt and timestamp < start_dt:
+                continue
+            if end_dt and timestamp > end_dt:
+                continue
+
+            records.append(record)
+
+    except Exception:
+        logger.exception("Blob telemetry retrieval failed")
+        raise HTTPException(
+            status_code=503,
+            detail="Unable to retrieve telemetry",
+        )
+
+    records.sort(
+        key=lambda r: (
+            r.get("device_timestamp") or r.get("received_at") or ""
+        ),
+        reverse=(sort == "newest"),
+    )
+
+    return {
+        "registered_device_id": registered_device_id,
+        "device_type": device_type,
+        "count": min(len(records), limit),
+        "sort": sort,
+        "telemetry": records[:limit],
+    }
