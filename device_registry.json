@@ -1,0 +1,47 @@
+{
+  "description": "Local simulator configuration using known registered device IDs.",
+  "devices": [
+    {
+      "data_mesh_id": "MESH001",
+      "registered_device_id": "IOMT-MEDICAL-8CC346",
+      "device_type": "ecg_monitor",
+      "telemetry_interval_seconds": 5
+    },
+    {
+      "data_mesh_id": "MESH001",
+      "registered_device_id": "IOMT-MEDICAL-0E2A0F",
+      "device_type": "glucose_monitor",
+      "telemetry_interval_seconds": 5
+    },
+    {
+      "data_mesh_id": "MESH001",
+      "registered_device_id": "IOMT-MEDICAL-1E5C71",
+      "device_type": "glucose_monitor",
+      "telemetry_interval_seconds": 5
+    },
+    {
+      "data_mesh_id": "MESH001",
+      "registered_device_id": "IOMT-MEDICAL-E15437",
+      "device_type": "glucose_monitor",
+      "telemetry_interval_seconds": 5
+    },
+    {
+      "data_mesh_id": "MESH001",
+      "registered_device_id": "IOMT-GLUCOSE-E90CD5",
+      "device_type": "glucose_monitor",
+      "telemetry_interval_seconds": 5
+    },
+    {
+      "data_mesh_id": "MESH001",
+      "registered_device_id": "IOMT-MEDICAL-B27D7E",
+      "device_type": "pulse_oximeter",
+      "telemetry_interval_seconds": 5
+    },
+    {
+      "data_mesh_id": "MESH001",
+      "registered_device_id": "IOMT-MEDICAL-BD41E5",
+      "device_type": "ecg_monitor",
+      "telemetry_interval_seconds": 5
+    }
+  ]
+}

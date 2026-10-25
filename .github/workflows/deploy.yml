@@ -1,0 +1,78 @@
+name: Build and Deploy IoMT Data Mesh
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  ACR_NAME: iomtbackendacr
+  ACR_LOGIN_SERVER: iomtbackendacr.azurecr.io
+  IMAGE_NAME: iomt-data-mesh
+  RESOURCE_GROUP: iomt-rg
+  WEB_APP_NAME: iomt-data-mesh-app
+
+jobs:
+  test-build-push:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest
+
+      - name: Run tests
+        run: python -m pytest -q
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Log in to Azure Container Registry
+        run: az acr login --name "$ACR_NAME"
+
+      - name: Build and push image
+        env:
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker buildx build \
+            --platform linux/amd64 \
+            --tag "$ACR_LOGIN_SERVER/$IMAGE_NAME:$IMAGE_TAG" \
+            --tag "$ACR_LOGIN_SERVER/$IMAGE_NAME:blob-v2" \
+            --push \
+            .
+
+      - name: Configure App Service to use this commit image
+        env:
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          az webapp config container set \
+            --name "$WEB_APP_NAME" \
+            --resource-group "$RESOURCE_GROUP" \
+            --docker-custom-image-name "$ACR_LOGIN_SERVER/$IMAGE_NAME:$IMAGE_TAG" \
+            --docker-registry-server-url "https://$ACR_LOGIN_SERVER"
+
+      - name: Restart App Service
+        run: |
+          az webapp restart \
+            --name "$WEB_APP_NAME" \
+            --resource-group "$RESOURCE_GROUP"
