@@ -16,6 +16,7 @@ from typing import Any
 import psycopg2
 from azure.storage.blob import BlobServiceClient, ContentSettings
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, Header, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 
@@ -254,6 +255,19 @@ app = FastAPI(
     title="IoMT Data Mesh Ingestion",
     version="2.1.0",
     lifespan=lifespan,
+)
+
+# Allow the deployed React frontend to read the public health endpoint.
+# Telemetry API authentication remains enforced by x-iomt-read-key.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "https://iomt-frontend-app.azurewebsites.net",
+        "http://localhost:5173",
+    ],
+    allow_credentials=False,
+    allow_methods=["GET", "OPTIONS"],
+    allow_headers=["Accept", "Content-Type", "x-iomt-read-key"],
 )
 
 
@@ -610,7 +624,7 @@ def read_device_telemetry(
             detail="Use valid ISO dates for start and end; start must not be after end",
         ) from exc
 
-    records = read_device_blobs(registered_device_id, registered_type, limit=1000)
+    records = read_device_blobs(registered_device_id, registered_type, limit=limit)
 
     filtered: list[dict[str, Any]] = []
     for record in records:
