@@ -8,9 +8,11 @@ import json
 import logging
 import os
 import re
+import threading
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import psycopg2
@@ -25,6 +27,9 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s",
 )
 logger = logging.getLogger("iomt-data-mesh")
+
+# Stops the full HTTP request/response dumps from the Azure SDK.
+logging.getLogger("azure").setLevel(logging.WARNING)
 
 
 # Use the existing database URL when the optional purpose-specific variable
@@ -169,17 +174,28 @@ def get_registered_device(
     }
 
 
-def get_blob_container():
-    """Return a client for the configured telemetry container."""
-    if not AZURE_STORAGE_CONNECTION_STRING:
-        raise RuntimeError(
-            "AZURE_STORAGE_CONNECTION_STRING is not configured"
-        )
+_container_client = None
+_container_lock = threading.Lock()
 
-    service = BlobServiceClient.from_connection_string(
-        AZURE_STORAGE_CONNECTION_STRING
-    )
-    return service.get_container_client(TELEMETRY_CONTAINER)
+
+def get_blob_container():
+    """Return a cached client for the configured telemetry container."""
+    global _container_client
+    if _container_client is None:
+        with _container_lock:
+            if _container_client is None:
+                if not AZURE_STORAGE_CONNECTION_STRING:
+                    raise RuntimeError(
+                        "AZURE_STORAGE_CONNECTION_STRING is not configured"
+                    )
+
+                service = BlobServiceClient.from_connection_string(
+                    AZURE_STORAGE_CONNECTION_STRING
+                )
+                _container_client = service.get_container_client(
+                    TELEMETRY_CONTAINER
+                )
+    return _container_client
 
 
 def save_telemetry(
@@ -510,6 +526,30 @@ async def websocket_endpoint(websocket: WebSocket):
 READ_API_KEY = os.getenv("IOMT_READ_API_KEY", "")
 
 
+def _parse_ts(text: str | None) -> datetime | None:
+    if not text:
+        return None
+    try:
+        ts = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        return None
+    return ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
+
+
+def _day_prefixes(base: str, start_dt, end_dt, newest: bool) -> list[str]:
+    """Narrow listing to per-day folders when a date range is known."""
+    if not start_dt:
+        return [base]
+    first = start_dt.astimezone(timezone.utc).date()
+    last = (end_dt or datetime.now(timezone.utc)).astimezone(timezone.utc).date()
+    if last < first or (last - first).days > 366:
+        return [base]
+    days = [first + timedelta(days=i) for i in range((last - first).days + 1)]
+    if newest:
+        days.reverse()
+    return [f"{base}{d:%Y/%m/%d}/" for d in days]
+
+
 def read_device_blobs(
     registered_device_id: str,
     device_type: str,
@@ -527,55 +567,67 @@ def read_device_blobs(
         )
 
     # IDs are path components, so reject separators before building a prefix.
-    if "/" in registered_device_id or "\\\\" in registered_device_id or registered_device_id in {".", ".."}:
+    if "/" in registered_device_id or "\\" in registered_device_id or registered_device_id in {".", ".."}:
         raise HTTPException(status_code=400, detail="Invalid registered device ID")
 
-    prefix = f"{PRODUCT_NAMES[product_id]}/{registered_device_id}/"
+    newest = sort != "oldest"
+    base = f"{PRODUCT_NAMES[product_id]}/{registered_device_id}/"
+    has_filter = bool(start_dt or end_dt)
+
+    def fetch(blob_name: str) -> dict[str, Any] | None:
+        try:
+            raw = container.download_blob(blob_name).readall()
+            record = json.loads(raw)
+        except (ValueError, UnicodeDecodeError):
+            logger.warning("Skipping invalid telemetry JSON blob: %s", blob_name)
+            return None
+        if not isinstance(record, dict):
+            return None
+        if record.get("registered_device_id") != registered_device_id:
+            return None
+        ts = _parse_ts(record.get("device_timestamp") or record.get("received_at"))
+        if ts is None:
+            return None
+        if (start_dt and ts < start_dt) or (end_dt and ts > end_dt):
+            return None
+        return record
+
     try:
         container = get_blob_container()
-
-        # Only list actual event files, never attempt to download folder-like paths.
-        blob_names = [
-            blob.name
-            for blob in container.list_blobs(name_starts_with=prefix)
-            if blob.name.endswith(".json")
-        ]
-        blob_names.sort(reverse=(sort != "oldest"))
-
         records: list[dict[str, Any]] = []
-        for blob_name in blob_names:
-            try:
-                raw = container.get_blob_client(blob_name).download_blob().readall()
-                record = json.loads(raw)
-                if not isinstance(record, dict):
-                    continue
-                if record.get("registered_device_id") != registered_device_id:
-                    continue
+        pending: list[str] = []
+        batch_size = 32 if has_filter else max(limit, 16)
 
-                timestamp_text = record.get("device_timestamp") or record.get("received_at")
-                if not timestamp_text:
-                    continue
-                try:
-                    timestamp = datetime.fromisoformat(timestamp_text.replace("Z", "+00:00"))
-                except (ValueError, AttributeError):
-                    logger.warning("Skipping telemetry record with invalid timestamp: %s", blob_name)
-                    continue
-                if timestamp.tzinfo is None:
-                    timestamp = timestamp.replace(tzinfo=timezone.utc)
+        def flush(executor) -> bool:
+            """Download one batch in parallel; return True when limit reached."""
+            nonlocal pending
+            batch, pending = pending[:batch_size], pending[batch_size:]
+            for rec in executor.map(fetch, batch):
+                if rec is not None:
+                    records.append(rec)
+                    if len(records) >= limit:
+                        return True
+            return False
 
-                if start_dt and timestamp < start_dt:
-                    continue
-                if end_dt and timestamp > end_dt:
-                    continue
-
-                records.append(record)
-                if len(records) >= limit:
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            done = False
+            for prefix in _day_prefixes(base, start_dt, end_dt, newest):
+                # Only list actual event files, never folder-like paths.
+                names = sorted(
+                    (
+                        b.name
+                        for b in container.list_blobs(name_starts_with=prefix)
+                        if b.name.endswith(".json")
+                    ),
+                    reverse=newest,
+                )
+                pending.extend(names)
+                while len(pending) >= batch_size and not done:
+                    done = flush(executor)
+                if done:
                     break
-            except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
-                logger.warning("Skipping invalid telemetry JSON blob: %s", blob_name)
-            except Exception:
-                logger.exception("Failed reading telemetry blob: %s", blob_name)
-                raise
+            while pending and not done:
+                done = flush(executor)
 
         return records
     except HTTPException:
