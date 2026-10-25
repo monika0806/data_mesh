@@ -514,8 +514,11 @@ def read_device_blobs(
     registered_device_id: str,
     device_type: str,
     limit: int,
+    start_dt: datetime | None = None,
+    end_dt: datetime | None = None,
+    sort: str = "newest",
 ) -> list[dict[str, Any]]:
-    """Read telemetry blobs for one registered device and its resolved product."""
+    """Read JSON telemetry for one device, applying time filters before limit."""
     product_id = product_for_type(device_type)
     if product_id is None:
         raise HTTPException(
@@ -523,29 +526,56 @@ def read_device_blobs(
             detail=f"Unsupported registered device type: {device_type}",
         )
 
-    # Blob paths are partitioned by product and registered device.
+    # IDs are path components, so reject separators before building a prefix.
+    if "/" in registered_device_id or "\\\\" in registered_device_id or registered_device_id in {".", ".."}:
+        raise HTTPException(status_code=400, detail="Invalid registered device ID")
+
     prefix = f"{PRODUCT_NAMES[product_id]}/{registered_device_id}/"
     try:
         container = get_blob_container()
-        blobs = container.list_blobs(name_starts_with=prefix)
 
-        # Sort blob paths newest-first before downloading, avoiding downloads
-        # of every historical blob when a device has a long history.
-        blob_names = sorted(
-            (blob.name for blob in blobs),
-            reverse=True,
-        )[:limit]
+        # Only list actual event files, never attempt to download folder-like paths.
+        blob_names = [
+            blob.name
+            for blob in container.list_blobs(name_starts_with=prefix)
+            if blob.name.endswith(".json")
+        ]
+        blob_names.sort(reverse=(sort != "oldest"))
 
         records: list[dict[str, Any]] = []
         for blob_name in blob_names:
             try:
                 raw = container.get_blob_client(blob_name).download_blob().readall()
                 record = json.loads(raw)
+                if not isinstance(record, dict):
+                    continue
                 if record.get("registered_device_id") != registered_device_id:
                     continue
+
+                timestamp_text = record.get("device_timestamp") or record.get("received_at")
+                if not timestamp_text:
+                    continue
+                try:
+                    timestamp = datetime.fromisoformat(timestamp_text.replace("Z", "+00:00"))
+                except (ValueError, AttributeError):
+                    logger.warning("Skipping telemetry record with invalid timestamp: %s", blob_name)
+                    continue
+                if timestamp.tzinfo is None:
+                    timestamp = timestamp.replace(tzinfo=timezone.utc)
+
+                if start_dt and timestamp < start_dt:
+                    continue
+                if end_dt and timestamp > end_dt:
+                    continue
+
                 records.append(record)
-            except (ValueError, json.JSONDecodeError):
-                logger.warning("Skipping invalid telemetry blob: %s", blob_name)
+                if len(records) >= limit:
+                    break
+            except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+                logger.warning("Skipping invalid telemetry JSON blob: %s", blob_name)
+            except Exception:
+                logger.exception("Failed reading telemetry blob: %s", blob_name)
+                raise
 
         return records
     except HTTPException:
@@ -624,7 +654,14 @@ def read_device_telemetry(
             detail="Use valid ISO dates for start and end; start must not be after end",
         ) from exc
 
-    records = read_device_blobs(registered_device_id, registered_type, limit=limit)
+    records = read_device_blobs(
+        registered_device_id,
+        registered_type,
+        limit=limit,
+        start_dt=start_dt,
+        end_dt=end_dt,
+        sort=sort,
+    )
 
     filtered: list[dict[str, Any]] = []
     for record in records:
