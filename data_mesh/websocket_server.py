@@ -17,7 +17,7 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 from azure.core.exceptions import AzureError
 from azure.storage.blob import BlobServiceClient, ContentSettings
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, Header, HTTPException
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 
