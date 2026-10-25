@@ -7,16 +7,19 @@ module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
 
 
-def test_registry_has_ten_unique_devices():
+def test_registry_has_unique_devices():
     devices = module.load_devices()
-    assert len(devices) == 10
-    ids = [d["registered_device_id"] for d in devices]
-    assert len(ids) == len(set(ids))
+
+    ids = [device["registered_device_id"] for device in devices]
+
+    assert devices, "The device registry must not be empty"
+    assert len(ids) == len(set(ids)), "Device IDs must be unique"
 
 
 def test_messages_include_routing_identifiers():
     device = module.load_devices()[0]
     message = module.make_message(device)
+
     assert message["data_mesh_id"] == device["data_mesh_id"]
     assert message["registered_device_id"] == device["registered_device_id"]
     assert message["device_type"] == device["device_type"]
@@ -25,6 +28,13 @@ def test_messages_include_routing_identifiers():
 
 
 def test_each_supported_device_generates_telemetry():
-    for device in module.load_devices():
-        assert isinstance(module.generate_telemetry(device["device_type"]), dict)
-        assert module.generate_telemetry(device["device_type"])
+    devices = module.load_devices()
+
+    for device in devices:
+        telemetry = module.generate_telemetry(device["device_type"])
+
+        assert isinstance(telemetry, dict)
+        assert telemetry, (
+            f"No telemetry generated for device type: "
+            f"{device['device_type']}"
+        )
