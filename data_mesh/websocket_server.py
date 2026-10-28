@@ -4,6 +4,7 @@ PostgreSQL is used only as the authoritative registration source. Telemetry is
 persisted as one JSON blob per event in a private Azure Blob Storage container.
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -11,15 +12,18 @@ import re
 import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import psycopg2
+from azure.core.pipeline.transport import RequestsTransport
 from azure.storage.blob import BlobServiceClient, ContentSettings
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from requests import Session
+from requests.adapters import HTTPAdapter
 
 
 logging.basicConfig(
@@ -174,6 +178,16 @@ def get_registered_device(
     }
 
 
+# Larger HTTP connection pool for Azure Blob Storage. The default pool size
+# is 10, which causes "Connection pool is full" warnings under parallel reads.
+_session = Session()
+_session.mount("https://", HTTPAdapter(pool_connections=50, pool_maxsize=50))
+_transport = RequestsTransport(session=_session, session_owner=False)
+
+# One executor shared by ALL requests, so total parallel blob downloads stay
+# at 8 regardless of how many API calls arrive at once (keep below pool_maxsize).
+_READ_EXECUTOR = ThreadPoolExecutor(max_workers=8)
+
 _container_client = None
 _container_lock = threading.Lock()
 
@@ -190,7 +204,10 @@ def get_blob_container():
                     )
 
                 service = BlobServiceClient.from_connection_string(
-                    AZURE_STORAGE_CONNECTION_STRING
+                    AZURE_STORAGE_CONNECTION_STRING,
+                    transport=_transport,
+                    connection_timeout=10,
+                    read_timeout=30,
                 )
                 _container_client = service.get_container_client(
                     TELEMETRY_CONTAINER
@@ -400,9 +417,11 @@ async def websocket_endpoint(websocket: WebSocket):
                 continue
 
             # Verify registration from the authoritative PostgreSQL source.
+            # Run in a worker thread so the event loop is not blocked.
             try:
-                registered = get_registered_device(
-                    message.registered_device_id
+                registered = await asyncio.to_thread(
+                    get_registered_device,
+                    message.registered_device_id,
                 )
 
             except Exception:
@@ -470,8 +489,10 @@ async def websocket_endpoint(websocket: WebSocket):
                 continue
 
             # Persist telemetry in Blob Storage. Acknowledge only after success.
+            # Run in a worker thread so the event loop is not blocked.
             try:
-                blob_name = save_telemetry(
+                blob_name = await asyncio.to_thread(
+                    save_telemetry,
                     message,
                     expected_product,
                 )
@@ -609,7 +630,8 @@ def read_device_blobs(
                         return True
             return False
 
-        with ThreadPoolExecutor(max_workers=8) as executor:
+        # Shared executor: caps total parallel downloads across all requests.
+        with nullcontext(_READ_EXECUTOR) as executor:
             done = False
             for prefix in _day_prefixes(base, start_dt, end_dt, newest):
                 # Only list actual event files, never folder-like paths.
