@@ -10,9 +10,10 @@ import logging
 import os
 import re
 import threading
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import asynccontextmanager, nullcontext
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -304,8 +305,9 @@ app.add_middleware(
 )
 
 
+# async so the root endpoint always answers, even when the worker threadpool is busy.
 @app.get("/")
-def home():
+async def home():
     return {
         "message": "IoMT Data Mesh WebSocket Server is running",
         "websocket": "/ws",
@@ -546,6 +548,12 @@ async def websocket_endpoint(websocket: WebSocket):
 
 READ_API_KEY = os.getenv("IOMT_READ_API_KEY", "")
 
+# Limits that keep one slow read from starving the whole app.
+READ_BUDGET_SECONDS = float(os.getenv("IOMT_READ_BUDGET_SECONDS", "8"))
+DEFAULT_LOOKBACK_HOURS = int(os.getenv("IOMT_DEFAULT_LOOKBACK_HOURS", "24"))
+MAX_CONCURRENT_READS = int(os.getenv("IOMT_MAX_CONCURRENT_READS", "6"))
+_read_slots = threading.BoundedSemaphore(MAX_CONCURRENT_READS)
+
 
 def _parse_ts(text: str | None) -> datetime | None:
     if not text:
@@ -557,18 +565,20 @@ def _parse_ts(text: str | None) -> datetime | None:
     return ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
 
 
-def _day_prefixes(base: str, start_dt, end_dt, newest: bool) -> list[str]:
-    """Narrow listing to per-day folders when a date range is known."""
-    if not start_dt:
-        return [base]
-    first = start_dt.astimezone(timezone.utc).date()
-    last = (end_dt or datetime.now(timezone.utc)).astimezone(timezone.utc).date()
-    if last < first or (last - first).days > 366:
-        return [base]
-    days = [first + timedelta(days=i) for i in range((last - first).days + 1)]
-    if newest:
-        days.reverse()
-    return [f"{base}{d:%Y/%m/%d}/" for d in days]
+def _hour_prefixes(base: str, start_dt, end_dt, newest: bool):
+    """Yield one prefix per UTC hour, lazily. Each list call returns ~700 blobs, not a whole day.
+
+    Edge case: a reading stamped just before 00:00 UTC but received just after sits in the
+    previous day's /00 folder; irrelevant for a live dashboard.
+    """
+    end_utc = (end_dt or datetime.now(timezone.utc) + timedelta(hours=1)).astimezone(timezone.utc)
+    start_utc = (start_dt or end_utc - timedelta(hours=DEFAULT_LOOKBACK_HOURS)).astimezone(timezone.utc)
+    first = start_utc.replace(minute=0, second=0, microsecond=0)
+    last = end_utc.replace(minute=0, second=0, microsecond=0)
+    count = int((last - first).total_seconds() // 3600) + 1
+    for i in range(max(count, 0)):
+        slot = last - timedelta(hours=i) if newest else first + timedelta(hours=i)
+        yield f"{base}{slot:%Y/%m/%d}/{slot:%H}"
 
 
 def read_device_blobs(
@@ -593,12 +603,12 @@ def read_device_blobs(
 
     newest = sort != "oldest"
     base = f"{PRODUCT_NAMES[product_id]}/{registered_device_id}/"
-    has_filter = bool(start_dt or end_dt)
+    deadline = time.monotonic() + READ_BUDGET_SECONDS
+    batch_size = max(1, min(limit, 32))
 
     def fetch(blob_name: str) -> dict[str, Any] | None:
         try:
-            raw = container.download_blob(blob_name).readall()
-            record = json.loads(raw)
+            record = json.loads(container.download_blob(blob_name).readall())
         except (ValueError, UnicodeDecodeError):
             logger.warning("Skipping invalid telemetry JSON blob: %s", blob_name)
             return None
@@ -613,44 +623,37 @@ def read_device_blobs(
             return None
         return record
 
+    # Fail fast instead of queueing: a backlog of slow reads starves the whole app.
+    if not _read_slots.acquire(timeout=2):
+        raise HTTPException(
+            status_code=503,
+            detail="Telemetry reader is busy; retry shortly",
+        )
     try:
         container = get_blob_container()
         records: list[dict[str, Any]] = []
-        pending: list[str] = []
-        batch_size = 32 if has_filter else max(limit, 16)
-
-        def flush(executor) -> bool:
-            """Download one batch in parallel; return True when limit reached."""
-            nonlocal pending
-            batch, pending = pending[:batch_size], pending[batch_size:]
-            for rec in executor.map(fetch, batch):
-                if rec is not None:
-                    records.append(rec)
-                    if len(records) >= limit:
-                        return True
-            return False
-
-        # Shared executor: caps total parallel downloads across all requests.
-        with nullcontext(_READ_EXECUTOR) as executor:
-            done = False
-            for prefix in _day_prefixes(base, start_dt, end_dt, newest):
-                # Only list actual event files, never folder-like paths.
-                names = sorted(
-                    (
-                        b.name
-                        for b in container.list_blobs(name_starts_with=prefix)
-                        if b.name.endswith(".json")
-                    ),
-                    reverse=newest,
+        for prefix in _hour_prefixes(base, start_dt, end_dt, newest):
+            if time.monotonic() > deadline:
+                logger.warning(
+                    "Read budget hit for %s; returning %d records",
+                    registered_device_id, len(records),
                 )
-                pending.extend(names)
-                while len(pending) >= batch_size and not done:
-                    done = flush(executor)
-                if done:
-                    break
-            while pending and not done:
-                done = flush(executor)
-
+                break
+            # Only list actual event files, never folder-like paths.
+            names = sorted(
+                (
+                    b.name
+                    for b in container.list_blobs(name_starts_with=prefix)
+                    if b.name.endswith(".json")
+                ),
+                reverse=newest,
+            )
+            for i in range(0, len(names), batch_size):
+                for rec in _READ_EXECUTOR.map(fetch, names[i:i + batch_size]):
+                    if rec is not None:
+                        records.append(rec)
+                        if len(records) >= limit:
+                            return records
         return records
     except HTTPException:
         raise
@@ -660,6 +663,8 @@ def read_device_blobs(
             status_code=503,
             detail="Telemetry storage is unavailable",
         ) from exc
+    finally:
+        _read_slots.release()
 
 
 @app.get("/api/telemetry")
