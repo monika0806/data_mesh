@@ -4,6 +4,20 @@ on:
   push:
     branches:
       - main
+    paths:
+      # Deploy the existing web application only when its files change.
+      - 'data_mesh/**'
+      - 'main.py'
+      - 'app.py'
+      - 'requirements.txt'
+      - 'Dockerfile'
+      - 'tests/**'
+     
+
+      # Do not trigger this workflow for simulator-worker-only changes.
+      - '!simulator-worker/**'
+
+  # Allows manual deployment from GitHub Actions.
   workflow_dispatch:
 
 permissions:
