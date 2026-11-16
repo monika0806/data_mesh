@@ -5,6 +5,8 @@ persisted as one JSON blob per event in a private Azure Blob Storage container.
 """
 
 import asyncio
+import base64
+import binascii
 import json
 import logging
 import os
@@ -23,6 +25,7 @@ from azure.storage.blob import BlobServiceClient, ContentSettings
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from data_mesh.secure_session import decrypt_and_consume
 from requests import Session
 from requests.adapters import HTTPAdapter
 
@@ -43,6 +46,27 @@ REGISTRATION_DATABASE_URL = (
     os.getenv("IOMT_REGISTRATION_DATABASE_URL")
     or os.getenv("IOMT_DATABASE_URL")
 )
+
+# Local development fallback: construct a DSN from the existing DB_* settings.
+if not REGISTRATION_DATABASE_URL and all(
+    os.getenv(name)
+    for name in ("DB_HOST", "DB_NAME", "DB_USER")
+):
+    dsn_options = {
+        "host": os.environ["DB_HOST"],
+        "port": os.getenv("DB_PORT", "5432"),
+        "dbname": os.environ["DB_NAME"],
+        "user": os.environ["DB_USER"],
+        "sslmode": os.getenv("DB_SSLMODE", "require"),
+    }
+
+    password = os.getenv("DB_PASSWORD")
+    if password:
+        dsn_options["password"] = password
+
+    REGISTRATION_DATABASE_URL = psycopg2.extensions.make_dsn(
+        **dsn_options
+    )
 
 AZURE_STORAGE_CONNECTION_STRING = os.getenv(
     "AZURE_STORAGE_CONNECTION_STRING"
@@ -122,6 +146,15 @@ class TelemetryMessage(BaseModel):
     device_type: str = Field(min_length=1)
     timestamp: datetime
     telemetry: dict[str, Any]
+
+
+class EncryptedTelemetryEnvelope(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    session_id: str = Field(min_length=1, max_length=64)
+    registered_device_id: str = Field(min_length=1, max_length=128)
+    nonce: str = Field(min_length=16, max_length=32)
+    ciphertext: str = Field(min_length=24, max_length=1400000)
 
 
 def canonical_type(value: str) -> str:
@@ -340,8 +373,8 @@ def health():
 
     if missing_configuration:
         return {
-            "status": "degraded",
             **status,
+            "status": "degraded",
             "missing_configuration": missing_configuration,
         }
 
@@ -388,17 +421,59 @@ async def websocket_endpoint(websocket: WebSocket):
 
     try:
         while True:
-            # Validate incoming telemetry message structure.
+            # Receive an encrypted envelope and authenticate/decrypt it.
             try:
                 raw_data = await websocket.receive_json()
-                message = TelemetryMessage.model_validate(raw_data)
+                envelope = EncryptedTelemetryEnvelope.model_validate(raw_data)
 
-            except (ValidationError, TypeError, ValueError) as exc:
+                nonce = base64.b64decode(
+                    envelope.nonce,
+                    validate=True,
+                )
+                ciphertext = base64.b64decode(
+                    envelope.ciphertext,
+                    validate=True,
+                )
+
+                def validate_telemetry(plaintext):
+                    message=TelemetryMessage.model_validate(
+                        json.loads(plaintext.decode("utf-8"))
+                    )
+
+                    if message.registered_device_id!=envelope.registered_device_id:
+                        raise ValueError("Device identity mismatch")
+
+                plaintext = await asyncio.to_thread(
+                    decrypt_and_consume,
+                    envelope.session_id,
+                    envelope.registered_device_id,
+                    nonce,
+                    ciphertext,
+                    validate_telemetry,
+                )
+
+                message = TelemetryMessage.model_validate(
+                    json.loads(plaintext.decode("utf-8"))
+                )
+
+                # The outer routing ID must match the encrypted identity.
+                if (
+                    message.registered_device_id
+                    != envelope.registered_device_id
+                ):
+                    raise ValueError("Device identity mismatch")
+
+            except (
+                ValidationError,
+                TypeError,
+                ValueError,
+                binascii.Error,
+                UnicodeDecodeError,
+            ):
                 await websocket.send_json(
                     {
                         "status": "rejected",
-                        "reason": "invalid_message",
-                        "detail": str(exc),
+                        "reason": "invalid_or_unauthenticated_message",
                     }
                 )
                 continue

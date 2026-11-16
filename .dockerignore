@@ -1,0 +1,13 @@
+.env
+.env.*
+.device_credentials.json
+.venv/
+.venv312/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.git/
+.github/
+.DS_Store
+*.log
