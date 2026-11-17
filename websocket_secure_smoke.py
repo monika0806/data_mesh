@@ -1,4 +1,3 @@
-
 import os
 import sys
 import json
@@ -7,7 +6,6 @@ import base64
 import secrets
 from pathlib import Path
 from datetime import datetime, timezone
-
 from dotenv import load_dotenv
 
 ROOT = Path.cwd()

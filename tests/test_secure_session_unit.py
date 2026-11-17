@@ -230,3 +230,29 @@ def test_decrypt_and_consume_rolls_back_invalid_ciphertext(monkeypatch):
 
     assert connection.rolled_back
     assert not connection.committed
+
+
+def test_decrypt_and_consume_rejects_expired_session(monkeypatch):
+    (
+        connection,
+        session_id,
+        device_id,
+        nonce,
+        ciphertext,
+        _,
+    ) = make_test_session(monkeypatch)
+
+    # Simulate the database finding no active, unexpired session.
+    connection.fake_cursor.row = None
+
+    with pytest.raises(ValueError, match="Session expired or invalid"):
+        secure.decrypt_and_consume(
+            session_id,
+            device_id,
+            nonce,
+            ciphertext,
+        )
+
+    assert connection.rolled_back
+    assert not connection.committed
+    assert connection.closed

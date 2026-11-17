@@ -407,6 +407,8 @@ def health():
     return status
 
 
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
@@ -425,7 +427,6 @@ async def websocket_endpoint(websocket: WebSocket):
             try:
                 raw_data = await websocket.receive_json()
                 envelope = EncryptedTelemetryEnvelope.model_validate(raw_data)
-
                 nonce = base64.b64decode(
                     envelope.nonce,
                     validate=True,

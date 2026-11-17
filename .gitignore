@@ -9,3 +9,5 @@ __pycache__/
 .env.example
 .DS_Store
 .device_credentials.json
+
+.local-certs/

@@ -262,6 +262,42 @@ class SecureDeviceClient:
 
         raise RuntimeError("Data Mesh did not confirm telemetry storage")
 
+    async def test_replay_protection(self, message):
+        """Send the exact same encrypted envelope twice and verify rejection."""
+
+        if self.websocket is None:
+            raise RuntimeError("WebSocket is not connected")
+
+        # Encrypt exactly once. Both transmissions use identical bytes.
+        envelope = self.encrypt_message(message)
+        encoded_envelope = json.dumps(envelope)
+
+        await self.websocket.send(encoded_envelope)
+        first_ack = json.loads(
+            await asyncio.wait_for(self.websocket.recv(), timeout=20)
+        )
+
+        if first_ack.get("status") != "stored":
+            raise RuntimeError("Initial telemetry was not stored")
+
+        logger.info("Initial telemetry stored successfully")
+
+        # Replay the identical envelope, including the same nonce.
+        await self.websocket.send(encoded_envelope)
+        replay_ack = json.loads(
+            await asyncio.wait_for(self.websocket.recv(), timeout=20)
+        )
+
+        if replay_ack.get("status") != "rejected":
+            raise RuntimeError("Replay was not rejected by Data Mesh")
+
+        logger.info(
+            "Replay protection successful: duplicate rejected; status=%s",
+            replay_ack.get("status"),
+        )
+
+        return replay_ack
+
     async def close(self):
         """Close WebSocket and revoke the temporary session."""
 
@@ -342,7 +378,7 @@ async def main():
             },
         }
 
-        await client.send_telemetry(message)
+        await client.test_replay_protection(message)
 
     finally:
         await client.close()
